@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment & secrets
+.env
+*.env
+config.local.py
+.env.local
+
+# Database — never commit, each env builds its own
+*.db
+*.sqlite
+*.sqlite3
+db/flowtracker.db
+
+# Logs
+*.log
+logs/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+#flow tracker debug data
+.last_run
+last_run.txt
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
