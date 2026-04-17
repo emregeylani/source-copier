@@ -307,12 +307,13 @@ def run(src_arg: str, dst_arg: str, ignored: set):
         if zip_path and zip_path.exists():
             print(f"  {C.YELLOW}🗜  Delete {label} zip file?{C.RESET}")
             print(f"     {fmt_path(zip_path)}")
-            print(f"  {C.BOLD}[Y/y = Yes, any other key = No]: {C.RESET}", end="", flush=True)
+            print(f"  {C.BOLD}[Enter/Y = Yes, any other key = No]: {C.RESET}", end="", flush=True)
             try:
                 answer = input().strip().lower()
             except (EOFError, KeyboardInterrupt):
                 answer = ""
-            if answer in ("y", "yes"):
+
+            if answer in ("", "y", "yes"):
                 try:
                     zip_path.unlink()
                     print(f"  {C.GREEN}✔  Deleted: {zip_path}{C.RESET}\n")
