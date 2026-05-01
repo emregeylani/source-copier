@@ -12,15 +12,19 @@ Usage:
 
     Third parameter is optional. Comma-separated folder names in quotes.
     Folders with these names are excluded from target search.
-    Example: "build,dist,.git,__pycache__"
+    Supports wildcard patterns (e.g. "*env*", "build", ".git").
+    Example: "build,dist,.git,__pycache__,*env*"
 
 Logic:
     • If a zip is given, it is automatically extracted to a temporary
       subfolder next to the zip. The temp folder is deleted on exit.
     • For each source file, files with the same name are searched in the target tree.
-    • 0 matches  → not found in target, skipped (info given).
+    • 0 matches  → not found in target; user prompted (default = target root,
+                   relative paths are joined to target root).
     • 1 match    → source file is copied over the target.
-    • 2+ matches → conflict warning, no action taken.
+    • 2+ matches → try to resolve by matching folder structure (e.g. db/__init__.py).
+                   If exactly one candidate shares the same parent folder name(s),
+                   it is used automatically. Otherwise a conflict warning is shown.
 """
 
 import sys
@@ -28,6 +32,7 @@ import shutil
 import zipfile
 import tempfile
 import atexit
+import fnmatch
 from pathlib import Path
 from datetime import datetime
 
@@ -48,7 +53,7 @@ class C:
 def banner():
     print(f"""
 {C.CYAN}{C.BOLD}╔══════════════════════════════════════════════╗
-║        SOURCE FILE COPIER  v1.1              ║
+║        SOURCE FILE COPIER  v1.2              ║
 ╚══════════════════════════════════════════════╝{C.RESET}
 """)
 
@@ -130,6 +135,23 @@ def resolve_input(arg: str, label: str) -> tuple[Path, Path | None]:
     return p, None
 
 
+# ── Ignored-pattern helpers ────────────────────────────────────────────────
+
+def part_is_ignored(part: str, patterns: set[str]) -> bool:
+    """
+    Return True if *part* (a single path component) matches any pattern in
+    *patterns*.  Supports plain names ("build") and wildcards ("*env*").
+    """
+    return any(fnmatch.fnmatch(part, pat) for pat in patterns)
+
+
+def path_is_ignored(p: Path, patterns: set[str]) -> bool:
+    """Return True if any component of *p* matches an ignored pattern."""
+    if not patterns:
+        return False
+    return any(part_is_ignored(part, patterns) for part in p.parts)
+
+
 # ── Core logic ─────────────────────────────────────────────────────────────
 
 def collect_sources(folder: Path) -> list[Path]:
@@ -137,19 +159,85 @@ def collect_sources(folder: Path) -> list[Path]:
     return [p for p in folder.rglob("*") if p.is_file()]
 
 
-def find_matches(filename: str, root: Path, ignored: set) -> list[Path]:
-    """Search recursively for files with the given name under root; skip ignored folders."""
+def find_matches(filename: str, root: Path, ignored: set[str]) -> list[Path]:
+    """Search recursively for files with the given name under root; skip ignored paths."""
     results = []
     for p in root.rglob(filename):
         if not p.is_file():
             continue
-        if ignored and ignored.intersection(set(p.parts)):
+        # Check each path component against wildcard-aware patterns
+        if path_is_ignored(p.relative_to(root), ignored):
             continue
         results.append(p)
     return results
 
 
-def run(src_arg: str, dst_arg: str, ignored: set):
+def resolve_by_folder_structure(src_rel: Path, matches: list[Path]) -> Path | None:
+    """
+    Improvement #1 – multiple matches: try to narrow down by comparing
+    the source's relative path parts (parent folders) with each candidate.
+
+    Strategy: count how many trailing path components the source and each
+    candidate share (excluding the filename itself).  The candidate with
+    the highest overlap — if it is strictly greater than all others — wins.
+
+    Example:
+        src_rel  = db/__init__.py   →  parents = ["db"]
+        candidate A: app/db/__init__.py   → parents ending with ["db"]  ✔
+        candidate B: utils/__init__.py    → parents ending with ["utils"] ✗
+
+    Returns the winning Path, or None if no clear winner exists.
+    """
+    src_parts = list(src_rel.parts[:-1])  # parent folder parts (no filename)
+
+    if not src_parts:
+        # Source is in the root – cannot disambiguate by folder
+        return None
+
+    def score(candidate: Path) -> int:
+        cand_parts = list(candidate.parts[:-1])  # absolute parts without filename
+        # Walk src_parts in reverse and count matching suffix
+        matched = 0
+        for s, c in zip(reversed(src_parts), reversed(cand_parts)):
+            if s == c:
+                matched += 1
+            else:
+                break
+        return matched
+
+    scores = [(score(m), m) for m in matches]
+    scores.sort(key=lambda x: x[0], reverse=True)
+
+    best_score, best_match = scores[0]
+    # Must have at least one folder match and be unique at that score
+    if best_score == 0:
+        return None
+    if len(scores) > 1 and scores[1][0] == best_score:
+        return None  # tie – cannot decide
+
+    return best_match
+
+
+def copy_file(src: Path, dst: Path, rel: Path, log: list, stats: dict, note: str = ""):
+    """Perform the actual copy and update stats/log."""
+    old_size = fmt_size(dst) if dst.exists() else "—"
+    try:
+        shutil.copy2(src, dst)
+        suffix = f"  {C.GREY}({note}){C.RESET}" if note else ""
+        print(f"  {C.GREEN}✔  Copied  →  {fmt_path(dst)}{suffix}")
+        print(f"     Old size: {old_size}  |  New size: {fmt_size(dst)}{C.RESET}")
+        stats["copied"] += 1
+        log.append({
+            "file":   str(rel),
+            "status": "COPIED",
+            "detail": f"→ {dst}  [old: {old_size}, new: {fmt_size(dst)}]{(' (' + note + ')') if note else ''}",
+        })
+    except Exception as e:
+        print(f"  {C.RED}✖  Copy error: {e}{C.RESET}")
+        log.append({"file": str(rel), "status": "ERROR", "detail": str(e)})
+
+
+def run(src_arg: str, dst_arg: str, ignored: set[str]):
     banner()
 
     # ── Resolve inputs (extract if zip)
@@ -163,7 +251,7 @@ def run(src_arg: str, dst_arg: str, ignored: set):
     print(f"  {C.BOLD}Source         :{C.RESET} {C.BLUE}{src_label}{C.RESET}")
     print(f"  {C.BOLD}Target         :{C.RESET} {C.BLUE}{dst_label}{C.RESET}")
     if ignored:
-        print(f"  {C.BOLD}Ignored folders:{C.RESET} {C.YELLOW}{', '.join(sorted(ignored))}{C.RESET}")
+        print(f"  {C.BOLD}Ignored patterns:{C.RESET} {C.YELLOW}{', '.join(sorted(ignored))}{C.RESET}")
     print(f"  {C.BOLD}Started        :{C.RESET} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     print(f"{C.GREY}{'─'*60}{C.RESET}\n")
 
@@ -185,81 +273,88 @@ def run(src_arg: str, dst_arg: str, ignored: set):
 
     # ── Process each source file
     for src in sources:
-        rel  = src.relative_to(src_root)
-        name = src.name
+        rel     = src.relative_to(src_root)
+        name    = src.name
         matches = find_matches(name, dst_root, ignored)
 
         print(f"{C.BOLD}► {rel}{C.RESET}  {C.GREY}({fmt_size(src)}){C.RESET}")
 
+        # ── 0 matches: not found ──────────────────────────────────────────
         if len(matches) == 0:
             print(f"  {C.YELLOW}⊘  No match found in target.{C.RESET}")
-            print(f"     {C.BOLD}Enter destination path (or press Enter to skip):{C.RESET} ", end="", flush=True)
+            print(
+                f"     {C.BOLD}Enter destination path "
+                f"{C.GREY}(Enter = {dst_root}  |  relative path joined to target root):{C.RESET} ",
+                end="", flush=True,
+            )
             try:
                 user_input = input().strip()
             except (EOFError, KeyboardInterrupt):
                 user_input = ""
 
+            # ── Improvement #2: default = target root; relative → joined to target root
             if not user_input:
-                msg = "No match found — skipped by user."
-                print(f"  {C.GREY}   Skipped.{C.RESET}")
-                stats["not_found"] += 1
-                log.append({"file": str(rel), "status": "NOT_FOUND", "detail": msg})
+                # No input → place file directly inside target root
+                manual_dst = dst_root / src.name
             else:
-                manual_dst = Path(user_input).expanduser().resolve()
-                if manual_dst.is_dir():
-                    # User gave a folder → place file inside it
-                    manual_dst = manual_dst / src.name
-                if not manual_dst.parent.exists():
-                    print(f"  {C.RED}✖  Directory does not exist: {manual_dst.parent} — skipped.{C.RESET}")
-                    stats["not_found"] += 1
-                    log.append({"file": str(rel), "status": "NOT_FOUND", "detail": f"Manual path invalid: {manual_dst}"})
+                given = Path(user_input).expanduser()
+                if given.is_absolute():
+                    manual_dst = given.resolve()
                 else:
-                    old_size = fmt_size(manual_dst) if manual_dst.exists() else "—"
-                    try:
-                        shutil.copy2(src, manual_dst)
-                        print(f"  {C.GREEN}✔  Copied  →  {fmt_path(manual_dst)}")
-                        print(f"     Old size: {old_size}  |  New size: {fmt_size(manual_dst)}{C.RESET}")
-                        stats["copied"] += 1
-                        log.append({
-                            "file":   str(rel),
-                            "status": "COPIED",
-                            "detail": f"→ {manual_dst} (manual)  [old: {old_size}, new: {fmt_size(manual_dst)}]",
-                        })
-                    except Exception as e:
-                        print(f"  {C.RED}✖  Copy error: {e}{C.RESET}")
-                        log.append({"file": str(rel), "status": "ERROR", "detail": str(e)})
+                    # Relative path → join to target root
+                    manual_dst = (dst_root / given).resolve()
 
-        elif len(matches) == 1:
-            dst = matches[0]
-            old_size = fmt_size(dst)
-            try:
-                shutil.copy2(src, dst)
-                print(f"  {C.GREEN}✔  Copied  →  {fmt_path(dst.relative_to(dst_root))}")
-                print(f"     Old size: {old_size}  |  New size: {fmt_size(dst)}{C.RESET}")
-                stats["copied"] += 1
+            # If the resolved destination is a directory, place file inside it
+            if manual_dst.is_dir():
+                manual_dst = manual_dst / src.name
+
+            if not manual_dst.parent.exists():
+                print(
+                    f"  {C.RED}✖  Directory does not exist: "
+                    f"{manual_dst.parent} — skipped.{C.RESET}"
+                )
+                stats["not_found"] += 1
                 log.append({
                     "file":   str(rel),
-                    "status": "COPIED",
-                    "detail": f"→ {dst}  [old: {old_size}, new: {fmt_size(dst)}]",
+                    "status": "NOT_FOUND",
+                    "detail": f"Manual path invalid: {manual_dst}",
                 })
-            except Exception as e:
-                print(f"  {C.RED}✖  Copy error: {e}{C.RESET}")
-                log.append({"file": str(rel), "status": "ERROR", "detail": str(e)})
+            else:
+                copy_file(src, manual_dst, rel, log, stats, note="manual")
 
+        # ── 1 match: straightforward copy ────────────────────────────────
+        elif len(matches) == 1:
+            copy_file(src, matches[0], rel, log, stats)
+
+        # ── 2+ matches: try folder-structure disambiguation ───────────────
         else:
-            print(f"  {C.YELLOW}⚠  CONFLICT — {len(matches)} matches found, no action taken:{C.RESET}")
-            for m in matches:
-                print(f"     {C.YELLOW}• {m}{C.RESET}")
-            stats["conflict"] += 1
-            log.append({
-                "file":   str(rel),
-                "status": "CONFLICT",
-                "detail": f"{len(matches)} matches: " + " | ".join(str(m) for m in matches),
-            })
+            winner = resolve_by_folder_structure(rel, matches)
+
+            if winner is not None:
+                print(
+                    f"  {C.CYAN}🔍 {len(matches)} matches found — resolved by folder structure:{C.RESET}"
+                )
+                for m in matches:
+                    marker = f"  {C.GREEN}✔ (selected){C.RESET}" if m == winner else f"  {C.GREY}(skipped){C.RESET}"
+                    print(f"     {C.CYAN}• {m}{marker}")
+                copy_file(src, winner, rel, log, stats, note="resolved by folder match")
+            else:
+                print(
+                    f"  {C.YELLOW}⚠  CONFLICT — {len(matches)} matches found, "
+                    f"no folder-structure winner, no action taken:{C.RESET}"
+                )
+                for m in matches:
+                    print(f"     {C.YELLOW}• {m}{C.RESET}")
+                stats["conflict"] += 1
+                log.append({
+                    "file":   str(rel),
+                    "status": "CONFLICT",
+                    "detail": f"{len(matches)} matches: " + " | ".join(str(m) for m in matches),
+                })
 
         print()
 
-    # ── Summary report
+    # ── Summary report ─────────────────────────────────────────────────────
     status_meta = {
         "COPIED":    (C.GREEN,  "✔", "COPIED     "),
         "CONFLICT":  (C.YELLOW, "⚠", "CONFLICT   "),
@@ -309,12 +404,29 @@ def run(src_arg: str, dst_arg: str, ignored: set):
 
 if __name__ == "__main__":
     if len(sys.argv) not in (3, 4):
-        print(f"\n{C.YELLOW}Usage: python3 source_file_copier.py <input1> <input2> [\"ignored1,ignored2\"]")
-        print(f"  input1 / input2 → folder path or .zip file{C.RESET}\n")
+        print(f"\n{C.YELLOW}Usage: python3 source_file_copier.py <source> <target> [\"ignored1,ignored2\"]")
+        print(f"  source  / target  → folder path or .zip file")
+        print(f"  ignored           → comma-separated names/patterns (wildcards OK, e.g. *env*){C.RESET}\n")
         sys.exit(1)
 
-    ignored: set = set()
+    ignored: set[str] = set()
     if len(sys.argv) == 4:
         ignored = {name.strip() for name in sys.argv[3].split(",") if name.strip()}
+
+    # ── Pre-flight confirmation ────────────────────────────────────────────
+    ignored_display = ", ".join(sorted(ignored)) if ignored else "(none)"
+    print(f"\n  {C.BOLD}Source  :{C.RESET} {C.BLUE}{sys.argv[1]}{C.RESET}")
+    print(f"  {C.BOLD}Target  :{C.RESET} {C.BLUE}{sys.argv[2]}{C.RESET}")
+    print(f"  {C.BOLD}Ignored :{C.RESET} {C.YELLOW}{ignored_display}{C.RESET}")
+    print(f"\n  {C.BOLD}Ready to start? {C.GREY}[Y/Enter = Start, n/N = Stop]:{C.RESET} ", end="", flush=True)
+
+    try:
+        answer = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+
+    if answer in ("n", "no"):
+        print(f"\n  {C.GREY}Aborted.{C.RESET}\n")
+        sys.exit(0)
 
     run(sys.argv[1], sys.argv[2], ignored)
