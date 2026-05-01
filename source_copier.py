@@ -282,26 +282,6 @@ def run(src_arg: str, dst_arg: str, ignored: set):
     print(f"\n  {C.BOLD}Total processed   : {len(sources)}{C.RESET}")
     print(f"  {C.BOLD}Finished          : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{C.RESET}\n")
 
-    # ── Detailed log file
-    log_path = Path("copy_report.log")
-    with log_path.open("w", encoding="utf-8") as f:
-        f.write("SOURCE FILE COPIER — Report\n")
-        f.write(f"Date    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Source  : {src_zip or src_root}\n")
-        f.write(f"Target  : {dst_zip or dst_root}\n")
-        if ignored:
-            f.write(f"Ignored : {', '.join(sorted(ignored))}\n")
-        f.write("─" * 60 + "\n\n")
-        for entry in log:
-            f.write(f"[{entry['status']:10s}]  {entry['file']}\n")
-            f.write(f"             {entry['detail']}\n\n")
-        f.write("─" * 60 + "\n")
-        f.write(f"Copied: {stats['copied']}  |  "
-                f"Conflicts: {stats['conflict']}  |  "
-                f"Not found: {stats['not_found']}\n")
-
-    print(f"  {C.CYAN}📄 Detailed log saved: {log_path.resolve()}{C.RESET}\n")
-
     # ── Option to delete zip files
     for zip_path, label in [(src_zip, "Source (INPUT1)"), (dst_zip, "Target (INPUT2)")]:
         if zip_path and zip_path.exists():
