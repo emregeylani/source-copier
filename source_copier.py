@@ -21,6 +21,8 @@ Logic:
     • For each source file, files with the same name are searched in the target tree.
     • 0 matches  → not found in target; user prompted (default = target root,
                    relative paths are joined to target root).
+                   If the source's parent folder name exists uniquely in the
+                   target tree, that folder is offered as a suggestion (S/Enter).
     • 1 match    → source file is copied over the target.
     • 2+ matches → try to resolve by matching folder structure (e.g. db/__init__.py).
                    If exactly one candidate shares the same parent folder name(s),
@@ -53,7 +55,7 @@ class C:
 def banner():
     print(f"""
 {C.CYAN}{C.BOLD}╔══════════════════════════════════════════════╗
-║        SOURCE FILE COPIER  v1.2              ║
+║        SOURCE FILE COPIER  v1.3              ║
 ╚══════════════════════════════════════════════╝{C.RESET}
 """)
 
@@ -172,6 +174,37 @@ def find_matches(filename: str, root: Path, ignored: set[str]) -> list[Path]:
     return results
 
 
+def find_suggested_folder(src_rel: Path, dst_root: Path, ignored: set[str]) -> Path | None:
+    """
+    Improvement #3 – new file suggestion:
+    Walk the source file's parent folder names (innermost first) and search the
+    target tree for a directory with that exact name.  The first level that yields
+    exactly ONE match (ignoring ignored patterns) is returned as the suggested
+    destination folder.  If no level yields a unique match, return None.
+
+    Example:
+        src_rel = entities/foo.py  →  tries "entities" first
+        target has exactly one folder named "entities"  →  suggest it
+    """
+    src_parts = list(src_rel.parts[:-1])  # parent folder components, no filename
+    if not src_parts:
+        return None  # file sits at source root → no folder hint
+
+    # Try from innermost parent outward
+    for folder_name in reversed(src_parts):
+        candidates = [
+            d for d in dst_root.rglob(folder_name)
+            if d.is_dir()
+            and not path_is_ignored(d.relative_to(dst_root), ignored)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        # Multiple hits at this level → try the next (broader) parent name,
+        # which is often more uniquely named.
+
+    return None
+
+
 def resolve_by_folder_structure(src_rel: Path, matches: list[Path]) -> Path | None:
     """
     Improvement #1 – multiple matches: try to narrow down by comparing
@@ -281,28 +314,49 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
 
         # ── 0 matches: not found ──────────────────────────────────────────
         if len(matches) == 0:
-            print(f"  {C.YELLOW}⊘  No match found in target.{C.RESET}")
-            print(
-                f"     {C.BOLD}Enter destination path "
-                f"{C.GREY}(Enter = {dst_root}  |  relative path joined to target root):{C.RESET} ",
-                end="", flush=True,
-            )
+            print(f"  {C.YELLOW}⊘  New file — not found in target.{C.RESET}")
+
+            # ── Improvement #3: suggest a unique matching folder in target
+            suggested_folder = find_suggested_folder(rel, dst_root, ignored)
+            suggested_dst    = suggested_folder / src.name if suggested_folder else None
+
+            if suggested_dst:
+                suggested_rel = suggested_dst.relative_to(dst_root)
+                print(f"     {C.CYAN}💡 Suggested: {fmt_path(suggested_dst)}{C.RESET}")
+                print(
+                    f"     {C.BOLD}Destination: "
+                    f"{C.GREY}[S/Enter = use suggestion  |  path = custom  |  empty = target root]:{C.RESET} ",
+                    end="", flush=True,
+                )
+            else:
+                print(
+                    f"     {C.BOLD}Destination: "
+                    f"{C.GREY}[Enter = target root  |  relative/absolute path]:{C.RESET} ",
+                    end="", flush=True,
+                )
+
             try:
                 user_input = input().strip()
             except (EOFError, KeyboardInterrupt):
                 user_input = ""
 
-            # ── Improvement #2: default = target root; relative → joined to target root
-            if not user_input:
-                # No input → place file directly inside target root
+            # ── Resolve user's choice
+            if suggested_dst and user_input.lower() in ("s", ""):
+                # S or plain Enter → accept suggestion
+                manual_dst = suggested_dst
+                note = f"suggested: {suggested_rel}"
+            elif not user_input:
+                # No suggestion active, plain Enter → target root
                 manual_dst = dst_root / src.name
+                note = "manual"
             else:
                 given = Path(user_input).expanduser()
                 if given.is_absolute():
                     manual_dst = given.resolve()
                 else:
-                    # Relative path → join to target root
+                    # Relative path joined to target root
                     manual_dst = (dst_root / given).resolve()
+                note = "manual"
 
             # If the resolved destination is a directory, place file inside it
             if manual_dst.is_dir():
@@ -320,7 +374,7 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
                     "detail": f"Manual path invalid: {manual_dst}",
                 })
             else:
-                copy_file(src, manual_dst, rel, log, stats, note="manual")
+                copy_file(src, manual_dst, rel, log, stats, note=note)
 
         # ── 1 match: straightforward copy ────────────────────────────────
         elif len(matches) == 1:
