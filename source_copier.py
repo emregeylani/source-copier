@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-source_file_copier.py
+source_copier.py
 ─────────────────────
 Searches for source files from Input1 (folder or zip) recursively in
 Input2 (target folder or zip) and copies / warns based on match count.
 
 Usage:
-    python3 source_file_copier.py <input1> <input2> ["ignored1,ignored2"]
+    python3 source_copier.py <input1> <input2> ["ignored1,ignored2"]
+    python3 source_copier.py <input1> p:<profile>
+    python3 source_copier.py --profiles
 
     input1 / input2 → folder path OR .zip file path
 
@@ -14,6 +16,10 @@ Usage:
     Folders with these names are excluded from target search.
     Supports wildcard patterns (e.g. "*env*", "build", ".git").
     Example: "build,dist,.git,__pycache__,*env*"
+
+    Profile mode: place a profiles.ini next to this script.
+    Pass p:<name> instead of target path (and optionally ignored).
+    Example: sc ~/Downloads/asset-manager.zip p:am
 
 Logic:
     • If a zip is given, it is automatically extracted to a temporary
@@ -35,6 +41,7 @@ import zipfile
 import tempfile
 import atexit
 import fnmatch
+import configparser
 from pathlib import Path
 from datetime import datetime
 
@@ -55,7 +62,7 @@ class C:
 def banner():
     print(f"""
 {C.CYAN}{C.BOLD}╔══════════════════════════════════════════════╗
-║        SOURCE FILE COPIER  v1.4              ║
+║        SOURCE FILE COPIER  v1.5              ║
 ╚══════════════════════════════════════════════╝{C.RESET}
 """)
 
@@ -96,7 +103,7 @@ def resolve_input(arg: str, label: str) -> tuple[Path, Path | None]:
       - If not a zip, zip_path is None.
       - If zip, extracted to a temp folder next to the zip; that path is returned.
     """
-    p = Path(arg).resolve()
+    p = Path(arg).expanduser().resolve()
 
     # ── Zip file?
     if p.suffix.lower() == ".zip":
@@ -137,6 +144,91 @@ def resolve_input(arg: str, label: str) -> tuple[Path, Path | None]:
     return p, None
 
 
+# ── Profile helpers ────────────────────────────────────────────────────────
+
+PROFILES_FILE = Path(__file__).resolve().parent / "profiles.ini"
+
+
+def load_profiles() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    if PROFILES_FILE.exists():
+        cfg.read(PROFILES_FILE)
+    return cfg
+
+
+def list_profiles():
+    """Print all available profiles and exit."""
+    cfg = load_profiles()
+    if not PROFILES_FILE.exists():
+        print(f"\n{C.YELLOW}⚠  profiles.ini not found at:{C.RESET}")
+        print(f"   {fmt_path(PROFILES_FILE)}")
+        print(f"\n{C.GREY}Create it with sections like:\n")
+        print(f"  [am]")
+        print(f"  target  = ~/git/asset-manager")
+        print(f"  ignored = __pycache__,*env*,.git\n{C.RESET}")
+        sys.exit(0)
+
+    sections = cfg.sections()
+    if not sections:
+        print(f"\n{C.YELLOW}⚠  profiles.ini exists but has no profiles.{C.RESET}\n")
+        sys.exit(0)
+
+    print(f"\n{C.BOLD}{C.WHITE}  Available profiles  ({PROFILES_FILE}){C.RESET}\n")
+    for name in sections:
+        target  = cfg[name].get("target",  "(not set)")
+        ignored = cfg[name].get("ignored", "(none)")
+        print(f"  {C.CYAN}{C.BOLD}[{name}]{C.RESET}")
+        print(f"    target  : {C.BLUE}{target}{C.RESET}")
+        print(f"    ignored : {C.YELLOW}{ignored}{C.RESET}")
+        print()
+    sys.exit(0)
+
+
+def resolve_profile(token: str) -> tuple[str, set[str]]:
+    """
+    Parse a 'p:<name>' token, load the profile from profiles.ini,
+    and return (target_str, ignored_set).
+    """
+    name = token[2:].strip()  # strip the "p:" prefix
+
+    cfg = load_profiles()
+
+    if not PROFILES_FILE.exists():
+        print(f"\n{C.RED}✖  profiles.ini not found at:{C.RESET}")
+        print(f"   {fmt_path(PROFILES_FILE)}")
+        print(f"{C.YELLOW}   Create it or run with --profiles for help.{C.RESET}\n")
+        sys.exit(1)
+
+    if name not in cfg:
+        available = ", ".join(cfg.sections()) or "(none)"
+        print(f"\n{C.RED}✖  Profile '{name}' not found in profiles.ini.{C.RESET}")
+        print(f"   {C.YELLOW}Available: {available}{C.RESET}\n")
+        sys.exit(1)
+
+    section = cfg[name]
+
+    target = section.get("target", "").strip()
+    if not target:
+        print(f"\n{C.RED}✖  Profile '{name}' has no 'target' defined.{C.RESET}\n")
+        sys.exit(1)
+
+    ignored_raw = section.get("ignored", "")
+    ignored = {p.strip() for p in ignored_raw.split(",") if p.strip()}
+
+    return target, ignored
+
+
+def is_profile_token(s: str) -> bool:
+    return s.startswith("p:") or s.startswith("p=")
+
+
+def normalize_profile_token(s: str) -> str:
+    """Accept both p:am and p=am."""
+    if s.startswith("p="):
+        return "p:" + s[2:]
+    return s
+
+
 # ── Ignored-pattern helpers ────────────────────────────────────────────────
 
 def part_is_ignored(part: str, patterns: set[str]) -> bool:
@@ -170,7 +262,6 @@ def find_matches(filename: str, root: Path, ignored: set[str]) -> list[Path]:
     for p in root.rglob(filename):
         if not p.is_file():
             continue
-        # Check each path component against wildcard-aware patterns
         if path_is_ignored(p.relative_to(root), ignored):
             continue
         results.append(p)
@@ -179,21 +270,15 @@ def find_matches(filename: str, root: Path, ignored: set[str]) -> list[Path]:
 
 def find_suggested_folder(src_rel: Path, dst_root: Path, ignored: set[str]) -> Path | None:
     """
-    Improvement #3 – new file suggestion:
     Walk the source file's parent folder names (innermost first) and search the
     target tree for a directory with that exact name.  The first level that yields
     exactly ONE match (ignoring ignored patterns) is returned as the suggested
     destination folder.  If no level yields a unique match, return None.
-
-    Example:
-        src_rel = entities/foo.py  →  tries "entities" first
-        target has exactly one folder named "entities"  →  suggest it
     """
-    src_parts = list(src_rel.parts[:-1])  # parent folder components, no filename
+    src_parts = list(src_rel.parts[:-1])
     if not src_parts:
-        return None  # file sits at source root → no folder hint
+        return None
 
-    # Try from innermost parent outward
     for folder_name in reversed(src_parts):
         candidates = [
             d for d in dst_root.rglob(folder_name)
@@ -202,37 +287,22 @@ def find_suggested_folder(src_rel: Path, dst_root: Path, ignored: set[str]) -> P
         ]
         if len(candidates) == 1:
             return candidates[0]
-        # Multiple hits at this level → try the next (broader) parent name,
-        # which is often more uniquely named.
 
     return None
 
 
 def resolve_by_folder_structure(src_rel: Path, matches: list[Path]) -> Path | None:
     """
-    Improvement #1 – multiple matches: try to narrow down by comparing
-    the source's relative path parts (parent folders) with each candidate.
-
-    Strategy: count how many trailing path components the source and each
-    candidate share (excluding the filename itself).  The candidate with
-    the highest overlap — if it is strictly greater than all others — wins.
-
-    Example:
-        src_rel  = db/__init__.py   →  parents = ["db"]
-        candidate A: app/db/__init__.py   → parents ending with ["db"]  ✔
-        candidate B: utils/__init__.py    → parents ending with ["utils"] ✗
-
-    Returns the winning Path, or None if no clear winner exists.
+    Try to narrow down multiple matches by comparing the source's relative
+    path parts (parent folders) with each candidate.
     """
-    src_parts = list(src_rel.parts[:-1])  # parent folder parts (no filename)
+    src_parts = list(src_rel.parts[:-1])
 
     if not src_parts:
-        # Source is in the root – cannot disambiguate by folder
         return None
 
     def score(candidate: Path) -> int:
-        cand_parts = list(candidate.parts[:-1])  # absolute parts without filename
-        # Walk src_parts in reverse and count matching suffix
+        cand_parts = list(candidate.parts[:-1])
         matched = 0
         for s, c in zip(reversed(src_parts), reversed(cand_parts)):
             if s == c:
@@ -245,11 +315,10 @@ def resolve_by_folder_structure(src_rel: Path, matches: list[Path]) -> Path | No
     scores.sort(key=lambda x: x[0], reverse=True)
 
     best_score, best_match = scores[0]
-    # Must have at least one folder match and be unique at that score
     if best_score == 0:
         return None
     if len(scores) > 1 and scores[1][0] == best_score:
-        return None  # tie – cannot decide
+        return None
 
     return best_match
 
@@ -273,25 +342,24 @@ def copy_file(src: Path, dst: Path, rel: Path, log: list, stats: dict, note: str
         log.append({"file": str(rel), "status": "ERROR", "detail": str(e)})
 
 
-def run(src_arg: str, dst_arg: str, ignored: set[str]):
+def run(src_arg: str, dst_arg: str, ignored: set[str], profile_name: str | None = None):
     banner()
 
-    # ── Resolve inputs (extract if zip)
     src_root, src_zip = resolve_input(src_arg, "INPUT1 (source)")
     dst_root, dst_zip = resolve_input(dst_arg, "INPUT2 (target)")
 
-    # ── Header info
     src_label = f"{src_zip}  {C.GREY}(zip → {src_root}){C.RESET}" if src_zip else str(src_root)
     dst_label = f"{dst_zip}  {C.GREY}(zip → {dst_root}){C.RESET}" if dst_zip else str(dst_root)
 
     print(f"  {C.BOLD}Source         :{C.RESET} {C.BLUE}{src_label}{C.RESET}")
     print(f"  {C.BOLD}Target         :{C.RESET} {C.BLUE}{dst_label}{C.RESET}")
+    if profile_name:
+        print(f"  {C.BOLD}Profile        :{C.RESET} {C.CYAN}[{profile_name}]{C.RESET}")
     if ignored:
         print(f"  {C.BOLD}Ignored patterns:{C.RESET} {C.YELLOW}{', '.join(sorted(ignored))}{C.RESET}")
     print(f"  {C.BOLD}Started        :{C.RESET} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     print(f"{C.GREY}{'─'*60}{C.RESET}\n")
 
-    # ── collect_sources now also filters ignored paths on the source side
     sources = collect_sources(src_root, ignored)
 
     if not sources:
@@ -300,7 +368,6 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
 
     print(f"{C.BOLD}Source file count: {len(sources)}{C.RESET}\n")
 
-    # ── Counters
     stats = {
         "copied":    0,
         "skipped":   0,
@@ -309,7 +376,6 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
     }
     log: list[dict] = []
 
-    # ── Process each source file
     for src in sources:
         rel     = src.relative_to(src_root)
         name    = src.name
@@ -317,11 +383,10 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
 
         print(f"{C.BOLD}► {rel}{C.RESET}  {C.GREY}({fmt_size(src)}){C.RESET}")
 
-        # ── 0 matches: not found ──────────────────────────────────────────
+        # ── 0 matches ────────────────────────────────────────────────────
         if len(matches) == 0:
             print(f"  {C.YELLOW}⊘  New file — not found in target.{C.RESET}")
 
-            # ── Improvement #3: suggest a unique matching folder in target
             suggested_folder = find_suggested_folder(rel, dst_root, ignored)
             suggested_dst    = suggested_folder / src.name if suggested_folder else None
 
@@ -345,9 +410,7 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
             except (EOFError, KeyboardInterrupt):
                 user_input = "x"
 
-            # ── Resolve user's choice
             if user_input.lower() in ("x", "\x1b"):
-                # X or Esc → skip
                 print(f"  {C.GREY}↷  Skipped.{C.RESET}")
                 stats["skipped"] += 1
                 log.append({
@@ -356,12 +419,9 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
                     "detail": "User skipped (new file)",
                 })
             elif suggested_dst and user_input.lower() == "s":
-                # S → accept suggestion
-                manual_dst = suggested_dst
                 note = f"suggested: {suggested_rel}"
-                _do_copy_manual(src, manual_dst, rel, log, stats, note)
+                _do_copy_manual(src, suggested_dst, rel, log, stats, note)
             elif not user_input:
-                # Plain Enter → target root (regardless of suggestion)
                 manual_dst = dst_root / src.name
                 _do_copy_manual(src, manual_dst, rel, log, stats, note="target root")
             else:
@@ -372,11 +432,11 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
                     manual_dst = (dst_root / given).resolve()
                 _do_copy_manual(src, manual_dst, rel, log, stats, note="manual")
 
-        # ── 1 match: straightforward copy ────────────────────────────────
+        # ── 1 match ──────────────────────────────────────────────────────
         elif len(matches) == 1:
             copy_file(src, matches[0], rel, log, stats)
 
-        # ── 2+ matches: try folder-structure disambiguation ───────────────
+        # ── 2+ matches ───────────────────────────────────────────────────
         else:
             winner = resolve_by_folder_structure(rel, matches)
 
@@ -405,7 +465,7 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
 
         print()
 
-    # ── Summary report ─────────────────────────────────────────────────────
+    # ── Summary ────────────────────────────────────────────────────────────
     status_meta = {
         "COPIED":    (C.GREEN,  "✔", "COPIED     "),
         "SKIPPED":   (C.GREY,   "↷", "SKIPPED    "),
@@ -435,7 +495,6 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
     print(f"\n  {C.BOLD}Total processed   : {len(sources)}{C.RESET}")
     print(f"  {C.BOLD}Finished          : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{C.RESET}\n")
 
-    # ── Conflict block ─────────────────────────────────────────────────────
     conflicts = [e for e in log if e["status"] == "CONFLICT"]
     if conflicts:
         print(f"{C.YELLOW}{C.BOLD}{'─'*60}")
@@ -449,7 +508,6 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
             print()
         print(f"{C.YELLOW}{'─'*60}{C.RESET}\n")
 
-    # ── Option to delete zip files
     for zip_path, label in [(src_zip, "Source (INPUT1)"), (dst_zip, "Target (INPUT2)")]:
         if zip_path and zip_path.exists():
             print(f"  {C.YELLOW}🗜  Delete {label} zip file?{C.RESET}")
@@ -469,12 +527,8 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
             else:
                 print(f"  {C.GREY}   Skipped, zip kept.{C.RESET}\n")
 
-    # atexit → temp folders are deleted automatically
-
 
 def _do_copy_manual(src: Path, manual_dst: Path, rel: Path, log: list, stats: dict, note: str):
-    """Helper: resolve directory targets then copy, or report invalid path."""
-    # If the resolved destination is a directory, place file inside it
     if manual_dst.is_dir():
         manual_dst = manual_dst / src.name
 
@@ -496,20 +550,61 @@ def _do_copy_manual(src: Path, manual_dst: Path, rel: Path, log: list, stats: di
 # ── Entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+
+    # ── --profiles flag ───────────────────────────────────────────────────
+    if len(sys.argv) == 2 and sys.argv[1] == "--profiles":
+        list_profiles()
+
+    # ── Validate arg count ────────────────────────────────────────────────
     if len(sys.argv) not in (3, 4):
-        print(f"\n{C.YELLOW}Usage: python3 source_file_copier.py <source> <target> [\"ignored1,ignored2\"]")
-        print(f"  source  / target  → folder path or .zip file")
-        print(f"  ignored           → comma-separated names/patterns (wildcards OK, e.g. *env*){C.RESET}\n")
+        print(f"\n{C.YELLOW}Usage:")
+        print(f"  python3 source_copier.py <source> <target> [\"ignored1,ignored2\"]")
+        print(f"  python3 source_copier.py <source> p:<profile>")
+        print(f"  python3 source_copier.py --profiles")
+        print(f"\n  source / target → folder path or .zip file")
+        print(f"  p:<profile>     → load target + ignored from profiles.ini")
+        print(f"  ignored         → comma-separated names/patterns (wildcards OK){C.RESET}\n")
         sys.exit(1)
 
+    # ── Detect profile token in argv[2] or argv[3] ────────────────────────
+    src_arg      = sys.argv[1]
+    profile_name = None
+    dst_arg      = None
     ignored: set[str] = set()
-    if len(sys.argv) == 4:
-        ignored = {name.strip() for name in sys.argv[3].split(",") if name.strip()}
 
-    # ── Pre-flight confirmation ────────────────────────────────────────────
+    raw2 = sys.argv[2]
+    raw3 = sys.argv[3] if len(sys.argv) == 4 else None
+
+    if is_profile_token(raw2):
+        # sc <source> p:am
+        token        = normalize_profile_token(raw2)
+        profile_name = token[2:]
+        dst_arg, ignored = resolve_profile(token)
+        # 4th arg is silently ignored when profile already provides ignored
+        if raw3:
+            print(
+                f"{C.YELLOW}⚠  Profile '{profile_name}' already sets ignored patterns — "
+                f"4th argument ignored.{C.RESET}"
+            )
+    elif raw3 and is_profile_token(raw3):
+        # sc <source> <target> p:am  (unusual but supported)
+        token        = normalize_profile_token(raw3)
+        profile_name = token[2:]
+        _, ignored   = resolve_profile(token)   # use explicit target, profile's ignored
+        dst_arg      = raw2
+    else:
+        # Classic mode: no profile token
+        dst_arg = raw2
+        if raw3:
+            ignored = {name.strip() for name in raw3.split(",") if name.strip()}
+
+    # ── Pre-flight confirmation ───────────────────────────────────────────
     ignored_display = ", ".join(sorted(ignored)) if ignored else "(none)"
-    print(f"\n  {C.BOLD}Source  :{C.RESET} {C.BLUE}{sys.argv[1]}{C.RESET}")
-    print(f"  {C.BOLD}Target  :{C.RESET} {C.BLUE}{sys.argv[2]}{C.RESET}")
+    profile_display = f"  {C.BOLD}Profile :{C.RESET} {C.CYAN}[{profile_name}]{C.RESET}\n" if profile_name else ""
+
+    print(f"\n  {C.BOLD}Source  :{C.RESET} {C.BLUE}{src_arg}{C.RESET}")
+    print(f"  {C.BOLD}Target  :{C.RESET} {C.BLUE}{dst_arg}{C.RESET}")
+    print(profile_display, end="")
     print(f"  {C.BOLD}Ignored :{C.RESET} {C.YELLOW}{ignored_display}{C.RESET}")
     print(f"\n  {C.BOLD}Ready to start? {C.GREY}[Y/Enter = Start, n/N = Stop]:{C.RESET} ", end="", flush=True)
 
@@ -522,4 +617,4 @@ if __name__ == "__main__":
         print(f"\n  {C.GREY}Aborted.{C.RESET}\n")
         sys.exit(0)
 
-    run(sys.argv[1], sys.argv[2], ignored)
+    run(src_arg, dst_arg, ignored, profile_name=profile_name)
