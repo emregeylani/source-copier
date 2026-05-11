@@ -55,7 +55,7 @@ class C:
 def banner():
     print(f"""
 {C.CYAN}{C.BOLD}╔══════════════════════════════════════════════╗
-║        SOURCE FILE COPIER  v1.3              ║
+║        SOURCE FILE COPIER  v1.4              ║
 ╚══════════════════════════════════════════════╝{C.RESET}
 """)
 
@@ -156,9 +156,12 @@ def path_is_ignored(p: Path, patterns: set[str]) -> bool:
 
 # ── Core logic ─────────────────────────────────────────────────────────────
 
-def collect_sources(folder: Path) -> list[Path]:
-    """Return all files (recursive) inside Input1."""
-    return [p for p in folder.rglob("*") if p.is_file()]
+def collect_sources(folder: Path, ignored: set[str]) -> list[Path]:
+    """Return all files (recursive) inside Input1, skipping ignored paths."""
+    return [
+        p for p in folder.rglob("*")
+        if p.is_file() and not path_is_ignored(p.relative_to(folder), ignored)
+    ]
 
 
 def find_matches(filename: str, root: Path, ignored: set[str]) -> list[Path]:
@@ -288,7 +291,8 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
     print(f"  {C.BOLD}Started        :{C.RESET} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     print(f"{C.GREY}{'─'*60}{C.RESET}\n")
 
-    sources = collect_sources(src_root)
+    # ── collect_sources now also filters ignored paths on the source side
+    sources = collect_sources(src_root, ignored)
 
     if not sources:
         print(f"{C.YELLOW}⚠  No files found in source folder.{C.RESET}")
@@ -299,6 +303,7 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
     # ── Counters
     stats = {
         "copied":    0,
+        "skipped":   0,
         "conflict":  0,
         "not_found": 0,
     }
@@ -325,56 +330,47 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
                 print(f"     {C.CYAN}💡 Suggested: {fmt_path(suggested_dst)}{C.RESET}")
                 print(
                     f"     {C.BOLD}Destination: "
-                    f"{C.GREY}[S/Enter = use suggestion  |  path = custom  |  empty = target root]:{C.RESET} ",
+                    f"{C.GREY}[S = suggested  |  Enter = target root  |  X = skip  |  path = custom]:{C.RESET} ",
                     end="", flush=True,
                 )
             else:
                 print(
                     f"     {C.BOLD}Destination: "
-                    f"{C.GREY}[Enter = target root  |  relative/absolute path]:{C.RESET} ",
+                    f"{C.GREY}[Enter = target root  |  X = skip  |  relative/absolute path]:{C.RESET} ",
                     end="", flush=True,
                 )
 
             try:
                 user_input = input().strip()
             except (EOFError, KeyboardInterrupt):
-                user_input = ""
+                user_input = "x"
 
             # ── Resolve user's choice
-            if suggested_dst and user_input.lower() in ("s", ""):
-                # S or plain Enter → accept suggestion
+            if user_input.lower() in ("x", "\x1b"):
+                # X or Esc → skip
+                print(f"  {C.GREY}↷  Skipped.{C.RESET}")
+                stats["skipped"] += 1
+                log.append({
+                    "file":   str(rel),
+                    "status": "SKIPPED",
+                    "detail": "User skipped (new file)",
+                })
+            elif suggested_dst and user_input.lower() == "s":
+                # S → accept suggestion
                 manual_dst = suggested_dst
                 note = f"suggested: {suggested_rel}"
+                _do_copy_manual(src, manual_dst, rel, log, stats, note)
             elif not user_input:
-                # No suggestion active, plain Enter → target root
+                # Plain Enter → target root (regardless of suggestion)
                 manual_dst = dst_root / src.name
-                note = "manual"
+                _do_copy_manual(src, manual_dst, rel, log, stats, note="target root")
             else:
                 given = Path(user_input).expanduser()
                 if given.is_absolute():
                     manual_dst = given.resolve()
                 else:
-                    # Relative path joined to target root
                     manual_dst = (dst_root / given).resolve()
-                note = "manual"
-
-            # If the resolved destination is a directory, place file inside it
-            if manual_dst.is_dir():
-                manual_dst = manual_dst / src.name
-
-            if not manual_dst.parent.exists():
-                print(
-                    f"  {C.RED}✖  Directory does not exist: "
-                    f"{manual_dst.parent} — skipped.{C.RESET}"
-                )
-                stats["not_found"] += 1
-                log.append({
-                    "file":   str(rel),
-                    "status": "NOT_FOUND",
-                    "detail": f"Manual path invalid: {manual_dst}",
-                })
-            else:
-                copy_file(src, manual_dst, rel, log, stats, note=note)
+                _do_copy_manual(src, manual_dst, rel, log, stats, note="manual")
 
         # ── 1 match: straightforward copy ────────────────────────────────
         elif len(matches) == 1:
@@ -401,9 +397,10 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
                     print(f"     {C.YELLOW}• {m}{C.RESET}")
                 stats["conflict"] += 1
                 log.append({
-                    "file":   str(rel),
-                    "status": "CONFLICT",
-                    "detail": f"{len(matches)} matches: " + " | ".join(str(m) for m in matches),
+                    "file":    str(rel),
+                    "status":  "CONFLICT",
+                    "detail":  f"{len(matches)} matches: " + " | ".join(str(m) for m in matches),
+                    "targets": [str(m) for m in matches],
                 })
 
         print()
@@ -411,6 +408,7 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
     # ── Summary report ─────────────────────────────────────────────────────
     status_meta = {
         "COPIED":    (C.GREEN,  "✔", "COPIED     "),
+        "SKIPPED":   (C.GREY,   "↷", "SKIPPED    "),
         "CONFLICT":  (C.YELLOW, "⚠", "CONFLICT   "),
         "NOT_FOUND": (C.GREY,   "⊘", "NOT FOUND  "),
         "ERROR":     (C.RED,    "✖", "ERROR      "),
@@ -421,15 +419,35 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
 
     for entry in log:
         color, icon, label = status_meta.get(entry["status"], (C.WHITE, "?", entry["status"]))
-        print(f"  {color}{icon} {label}  {C.BOLD}{entry['file']}{C.RESET}")
-        print(f"           {C.GREY}{entry['detail']}{C.RESET}")
+        if entry["status"] == "CONFLICT":
+            print(f"  {color}{icon} {label}  {C.BOLD}{entry['file']}{C.RESET}  {C.YELLOW}← NOT COPIED{C.RESET}")
+            print(f"           {C.GREY}Source : {src_root / entry['file']}{C.RESET}")
+            print(f"           {C.GREY}{entry['detail']}{C.RESET}")
+        else:
+            print(f"  {color}{icon} {label}  {C.BOLD}{entry['file']}{C.RESET}")
+            print(f"           {C.GREY}{entry['detail']}{C.RESET}")
 
     print(f"\n{C.GREY}{'─'*60}{C.RESET}")
     print(f"  {C.GREEN}✔  Copied          : {stats['copied']}{C.RESET}")
+    print(f"  {C.GREY}↷  Skipped         : {stats['skipped']}{C.RESET}")
     print(f"  {C.YELLOW}⚠  Conflicts (skip): {stats['conflict']}{C.RESET}")
     print(f"  {C.GREY}⊘  Not found       : {stats['not_found']}{C.RESET}")
     print(f"\n  {C.BOLD}Total processed   : {len(sources)}{C.RESET}")
     print(f"  {C.BOLD}Finished          : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{C.RESET}\n")
+
+    # ── Conflict block ─────────────────────────────────────────────────────
+    conflicts = [e for e in log if e["status"] == "CONFLICT"]
+    if conflicts:
+        print(f"{C.YELLOW}{C.BOLD}{'─'*60}")
+        print(f"  ⚠  UNRESOLVED CONFLICTS — FILES NOT COPIED ({len(conflicts)})")
+        print(f"{'─'*60}{C.RESET}")
+        for e in conflicts:
+            print(f"  {C.YELLOW}{C.BOLD}• {e['file']}{C.RESET}")
+            print(f"    {C.CYAN}Source : {src_root / e['file']}{C.RESET}")
+            for t in e.get("targets", []):
+                print(f"    {C.GREY}Target : {t}{C.RESET}")
+            print()
+        print(f"{C.YELLOW}{'─'*60}{C.RESET}\n")
 
     # ── Option to delete zip files
     for zip_path, label in [(src_zip, "Source (INPUT1)"), (dst_zip, "Target (INPUT2)")]:
@@ -452,6 +470,27 @@ def run(src_arg: str, dst_arg: str, ignored: set[str]):
                 print(f"  {C.GREY}   Skipped, zip kept.{C.RESET}\n")
 
     # atexit → temp folders are deleted automatically
+
+
+def _do_copy_manual(src: Path, manual_dst: Path, rel: Path, log: list, stats: dict, note: str):
+    """Helper: resolve directory targets then copy, or report invalid path."""
+    # If the resolved destination is a directory, place file inside it
+    if manual_dst.is_dir():
+        manual_dst = manual_dst / src.name
+
+    if not manual_dst.parent.exists():
+        print(
+            f"  {C.RED}✖  Directory does not exist: "
+            f"{manual_dst.parent} — skipped.{C.RESET}"
+        )
+        stats["not_found"] += 1
+        log.append({
+            "file":   str(rel),
+            "status": "NOT_FOUND",
+            "detail": f"Manual path invalid: {manual_dst}",
+        })
+    else:
+        copy_file(src, manual_dst, rel, log, stats, note=note)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
